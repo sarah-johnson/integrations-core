@@ -1,6 +1,7 @@
 # (C) Datadog, Inc. 2010-present
 # All rights reserved
 # Licensed under Simplified BSD License (see LICENSE)
+import copy
 import fnmatch
 import ipaddress
 import json
@@ -69,12 +70,14 @@ class SnmpCheck(AgentCheck):
 
         self.ignore_nonincreasing_oid = is_affirmative(self.init_config.get('ignore_nonincreasing_oid', False))
 
-        self.profiles = self.init_config.get('profiles', {})  # type: Dict[str, Dict[str, Any]]
+        self.profiles = copy.deepcopy(self.init_config.get('profiles', {}))  # type: Dict[str, Dict[str, Any]]
         self.profiles_by_oid = {}  # type: Dict[str, str]
         self._load_profiles()
 
         self.instance['name'] = self._get_instance_name(self.instance)
         self._config = self._build_config(self.instance)
+
+        self._scheduled_hosts = set()
 
     def _load_profiles(self):
         # type: () -> None
@@ -354,23 +357,59 @@ class SnmpCheck(AgentCheck):
         self._thread.daemon = True
         self._thread.start()
 
+    _k8s_client = None
+
+    def _get_k8s_client(self):
+        if self._k8s_client is None:
+            from kubernetes import client, config
+
+            config.load_incluster_config()
+            self._k8s_client = client.CoreV1Api()
+        return self._k8s_client
+
+    def _get_k8s_service(self, config, client):
+        label_selector = config.kubernetes_label_selector
+        services = client.list_service_for_all_namespaces(watch=False, label_selector=label_selector)
+        if len(services.items) != 1:
+            raise CheckException("Got %d services" % len(services.items))
+        return services.items[0].to_dict()
+
+    def _update_k8s_service(self, client, service, instances):
+        init_configs = [self.init_config] * len(instances)
+        check_names = ['snmp'] * len(instances)
+        body = {
+            'metadata': {
+                'annotations': {
+                    'ad.datadoghq.com/endpoints.check_names': json.dumps(check_names),
+                    'ad.datadoghq.com/endpoints.init_configs': json.dumps(init_configs),
+                    'ad.datadoghq.com/endpoints.instances': json.dumps(instances),
+                }
+            }
+        }
+        client.patch_namespaced_service(service['metadata']['name'], service['metadata']['namespace'], body)
+
     def check(self, instance):
         # type: (Dict[str, Any]) -> None
         config = self._config
         if config.ip_network:
             if self._thread is None:
                 self._start_discovery()
-            for host, discovered in list(config.discovered_instances.items()):
-                if self._check_with_config(discovered):
-                    config.failing_instances[host] += 1
-                    if config.failing_instances[host] >= config.allowed_failures:
-                        # Remove it from discovered instances, we'll re-discover it later if it reappears
-                        config.discovered_instances.pop(host)
-                        # Reset the failure counter as well
-                        config.failing_instances.pop(host)
-                else:
-                    # Reset the counter if not's failing
-                    config.failing_instances.pop(host, None)
+
+            current_hosts = set(config.discovered_instances)
+            if not current_hosts or current_hosts == self._scheduled_hosts:
+                return
+
+            instances = []
+            for discovered in list(config.discovered_instances.values()):
+                instance = discovered.instance
+                instance['metrics'] = discovered.metrics
+                instances.append(instance)
+
+            k8s_client = self._get_k8s_client()
+            k8s_service = self._get_k8s_service(k8s_client)
+            self._update_k8s_service(k8s_client, k8s_service, instances)
+            self._scheduled_hosts = current_hosts
+
             tags = ['network:{}'.format(config.ip_network)]
             tags.extend(config.tags)
             self.gauge('snmp.discovered_devices_count', len(config.discovered_instances), tags=tags)
