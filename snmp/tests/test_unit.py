@@ -254,6 +254,11 @@ def test_cache_building(write_mock, read_mock):
 
     check = SnmpCheck('snmp', {}, [instance])
 
+    def fetch_error(cfg):
+        raise RuntimeError("fail")
+
+    check.fetch_sysobject_oid = fetch_error
+
     check._config.discovered_instances['192.168.0.1'] = InstanceConfig(discovered_instance)
     check._start_discovery()
 
